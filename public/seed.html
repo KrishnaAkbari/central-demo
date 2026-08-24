@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Seeding...</title>
+<script>
+// Seed localStorage with a demo user + org
+const now = new Date().toISOString();
+const userId = 'usr_demo1';
+const orgId = 'org_demo1';
+
+const user = {
+  id: userId,
+  email: 'demo@central.local',
+  name: 'Demo User',
+  passwordHash: 'mock:demo',
+  createdAt: now,
+};
+const org = {
+  id: orgId,
+  name: 'Demo Org',
+  ownerId: userId,
+  createdAt: now,
+};
+const member = {
+  id: 'mem_demo1',
+  orgId: orgId,
+  userId: userId,
+  roleId: null,
+  createdAt: now,
+};
+const auth = {
+  token: 'cp_' + 'a'.repeat(32),
+  userId: userId,
+  loginAt: now,
+};
+
+localStorage.setItem('cp_users', JSON.stringify([user]));
+localStorage.setItem('cp_organizations', JSON.stringify([org]));
+localStorage.setItem('cp_memberships', JSON.stringify([member]));
+localStorage.setItem('cp_active_org', orgId);
+localStorage.setItem('cp_auth', JSON.stringify(auth));
+
+document.body.innerHTML = '<p>Seeded. Redirecting...</p>';
+setTimeout(() => { location.href = '/servers/add/create'; }, 200);
+</script>
+</head>
+<body>Loading...</body>
+</html>

@@ -1,0 +1,241 @@
+/* shadcn-style animation keyframes inlined here so Turbopack's CSS
+   module resolver doesn't have to chase the style-only exports of
+   `tw-animate-css` and `shadcn/tailwind.css`. The contract these
+   keyframes support is the data-open / data-closed animation state
+   on @base-ui/react components, plus animate-in/animate-out. */
+@keyframes enter {
+  from {
+    opacity: var(--tw-enter-opacity, 1);
+    transform: translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+      scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), var(--tw-enter-scale, 1))
+      rotate(var(--tw-enter-rotate, 0));
+    filter: blur(var(--tw-enter-blur, 0));
+  }
+}
+
+@keyframes exit {
+  to {
+    opacity: var(--tw-exit-opacity, 1);
+    transform: translate3d(var(--tw-exit-translate-x, 0), var(--tw-exit-translate-y, 0), 0)
+      scale3d(var(--tw-exit-scale, 1), var(--tw-exit-scale, 1), var(--tw-exit-scale, 1))
+      rotate(var(--tw-exit-rotate, 0));
+    filter: blur(var(--tw-exit-blur, 0));
+  }
+}
+
+.animate-in {
+  animation: enter var(--tw-animation-duration, var(--tw-duration, 150ms))
+    var(--tw-ease, ease) var(--tw-animation-delay, 0s)
+    var(--tw-animation-iteration-count, 1) var(--tw-animation-direction, normal)
+    var(--tw-animation-fill-mode, none);
+}
+.animate-out {
+  animation: exit var(--tw-animation-duration, var(--tw-duration, 150ms))
+    var(--tw-ease, ease) var(--tw-animation-delay, 0s)
+    var(--tw-animation-iteration-count, 1) var(--tw-animation-direction, normal)
+    var(--tw-animation-fill-mode, none);
+}
+.fade-in-0 { --tw-enter-opacity: 0; }
+.fade-out-0 { --tw-exit-opacity: 0; }
+.zoom-in-95 { --tw-enter-scale: .95; }
+.zoom-out-95 { --tw-exit-scale: .95; }
+.slide-in-from-top-2 { --tw-enter-translate-y: calc(var(--spacing) * -2); }
+.slide-in-from-bottom-2 { --tw-enter-translate-y: calc(var(--spacing) * 2); }
+.slide-in-from-left-2 { --tw-enter-translate-x: calc(var(--spacing) * -2); }
+.slide-in-from-right-2 { --tw-enter-translate-x: calc(var(--spacing) * 2); }
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    @apply border-border outline-ring;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    @apply bg-background text-foreground;
+  }
+  .theme {
+    --font-heading: var(--font-sans);
+    --font-sans: var(--font-sans);
+  }
+  :root {
+    --background: 1 0 0;
+    --foreground: 0.145 0 0;
+    --card: 1 0 0;
+    --card-foreground: 0.145 0 0;
+    --popover: 1 0 0;
+    --popover-foreground: 0.145 0 0;
+    --primary: 0.488 0.243 264.376;
+    --primary-foreground: 0.985 0 0;
+    --secondary: 0.97 0 0;
+    --secondary-foreground: 0.205 0 0;
+    --muted: 0.97 0 0;
+    --muted-foreground: 0.556 0 0;
+    --accent: 0.97 0 0;
+    --accent-foreground: 0.205 0 0;
+    --destructive: 0.577 0.245 27.325;
+    --border: 0.922 0 0;
+    --input: 0.922 0 0;
+    --ring: 0.488 0.243 264.376;
+    --chart-1: 0.87 0 0;
+    --chart-2: 0.556 0 0;
+    --chart-3: 0.439 0 0;
+    --chart-4: 0.371 0 0;
+    --chart-5: 0.269 0 0;
+    --radius: 0.625rem;
+    --sidebar: 0.985 0 0;
+    --sidebar-foreground: 0.145 0 0;
+    --sidebar-primary: 0.205 0 0;
+    --sidebar-primary-foreground: 0.985 0 0;
+    --sidebar-accent: 0.97 0 0;
+    --sidebar-accent-foreground: 0.205 0 0;
+    --sidebar-border: 0.922 0 0;
+    --sidebar-ring: 0.708 0 0;
+  }
+  .dark {
+    --background: 0.145 0 0;
+    --foreground: 0.985 0 0;
+    --card: 0.205 0 0;
+    --card-foreground: 0.985 0 0;
+    --popover: 0.205 0 0;
+    --popover-foreground: 0.985 0 0;
+    --primary: 0.511 0.262 276.966;
+    --primary-foreground: 0.985 0 0;
+    --secondary: 0.269 0 0;
+    --secondary-foreground: 0.985 0 0;
+    --muted: 0.269 0 0;
+    --muted-foreground: 0.708 0 0;
+    --accent: 0.269 0 0;
+    --accent-foreground: 0.985 0 0;
+    --destructive: 0.704 0.191 22.216;
+    --border: 1 0 0 / 10%;
+    --input: 1 0 0 / 15%;
+    --ring: 0.511 0.262 276.966;
+    --chart-1: 0.87 0 0;
+    --chart-2: 0.556 0 0;
+    --chart-3: 0.439 0 0;
+    --chart-4: 0.371 0 0;
+    --chart-5: 0.269 0 0;
+    --sidebar: 0.205 0 0;
+    --sidebar-foreground: 0.985 0 0;
+    --sidebar-primary: 0.488 0.243 264.376;
+    --sidebar-primary-foreground: 0.985 0 0;
+    --sidebar-accent: 0.269 0 0;
+    --sidebar-accent-foreground: 0.985 0 0;
+    --sidebar-border: 1 0 0 / 10%;
+    --sidebar-ring: 0.556 0 0;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* Mobile-first responsive scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgb(226 232 240);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(203 213 225);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(148 163 184);
+}
+
+.dark ::-webkit-scrollbar-track {
+  background: rgb(30 41 59);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: rgb(71 85 105);
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgb(100 116 139);
+}
+
+/* Touch-friendly interactions */
+@media (max-width: 768px) {
+  button:not([role="switch"]), a, [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  input, select, textarea {
+    min-height: 44px;
+  }
+}
+
+/* Prevent text size adjustment on mobile */
+@media (max-width: 768px) {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+}
+
+/* Better focus states for accessibility */
+:focus-visible {
+  outline: 2px solid rgb(99 102 241);
+  outline-offset: 2px;
+}
+
+/* Smooth scroll behavior */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Animation utilities */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* Reduced-motion: respect users who request less animation. Zero out
+   animation and transition durations on every element + pseudo-element
+   while keeping the final state intact (opacity 1, transform 0). Tailwind
+   `motion-safe:` modifier is unaffected — explicit @media rule here is
+   the system-level override that always wins. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+
+/* App-level background — single solid surface in each theme. Card
+   hierarchy comes from two dark shades (slate-950 canvas, slate-900
+   cards) in dark mode, and white-on-slate-50 in light mode. No
+   gradients, no decoration — modern 2026 admin panels rely on
+   surface elevation and hairline borders, not visual polish. */
+body {
+  background-color: rgb(248 250 252); /* slate-50 light */
+  min-height: 100vh;
+}
+.dark body {
+  background-color: rgb(2 6 23); /* slate-950 canvas */
+}

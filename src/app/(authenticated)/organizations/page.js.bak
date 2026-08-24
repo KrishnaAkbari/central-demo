@@ -1,0 +1,991 @@
+'use client'
+
+/**
+ * /organizations — every Organization the signed-in user belongs to.
+ *
+ * Polish parity with /servers and /members: stat row, search/filter/sort,
+ * shadcn Table on desktop + card list on mobile, skeletons during initial
+ * load, inline rename (no separate dialog), per-row switch/rename/delete,
+ * reusability hooks via the `useCount`-style reads, and a single
+ * ConfirmDialog for destructive delete.
+ *
+ * Scope deliberately omits bulk actions: delete is gated by
+ * `roleId === null` (owner-only) AND `ownedCount > 1`, so a checkbox
+ * column would only be useful for a narrow subset and add zero value
+ * to the more common case where the user owns a single Org.
+ */
+
+import React, { useEffect, useMemo, useState } from 'react'
+import {
+  Building2, Plus, Pencil, Trash2, Check, X,
+  Filter, ArrowUpDown, Loader2, ShieldCheck, UserPlus } from 'lucide-react'
+
+import { Card } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Badge } from '@/components/ui/badge'
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from '@/components/ui/table'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+} from '@/components/ui/dialog'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { FieldRow } from '@/components/ui/field'
+import { EmptyState, LoadingState, PageContainer, PageHeader } from '@/components/ui/page'
+import { Skeleton } from '@/components/ui/skeleton'
+import { StatRow } from '@/components/primitives/StatRow'
+import { ListToolbar } from '@/components/primitives/ListToolbar'
+import { NoMatchesState } from '@/components/primitives/NoMatchesState'
+import { useListToolbarState } from '@/hooks/useListToolbarState'
+import { showToast } from '@/utils/toast-utils'
+import { cn } from '@/lib/utils'
+
+import { useAuthStore } from '@/stores/authStore'
+import { useOrganizationStore } from '@/stores/organizationStore'
+import { useCan } from '@/hooks/useCan'
+import * as api from '@/services/centralApi'
+
+// ---------------------------------------------------------------------------
+// Constants — kept at module scope so the same metadata drives TableRow,
+// CardRow, stat tiles, and the role-filter dropdown without duplication.
+// ---------------------------------------------------------------------------
+
+const ROLE_META = {
+  owner:  { label: 'Owner',  variant: 'warning', color: 'amber'  },
+  admin:  { label: 'Admin',  variant: 'info',    color: 'indigo' },
+  member: { label: 'Member', variant: 'default', color: 'slate'  },
+  viewer: { label: 'Viewer', variant: 'default', color: 'slate'  },
+}
+
+const ROLE_SORT_ORDER = { owner: 0, admin: 1, member: 2, viewer: 3 }
+const ROLE_SORT_FALLBACK = 99
+
+const SORT_OPTIONS = [
+  { value: 'name',        label: 'Name (A→Z)'    },
+  { value: 'name-desc',   label: 'Name (Z→A)'    },
+  { value: 'created',     label: 'Newest first'  },
+  { value: 'created-asc', label: 'Oldest first'  },
+  { value: 'role',        label: 'My role'       },
+]
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Human-readable relative time ("3m ago", "2h ago", "5d ago") for the
+// "Last active" hint on each organization row. Returns null for older
+// than 30 days so we never show stale or misleading numbers.
+function formatRelative(ts) {
+  if (!ts || !Number.isFinite(ts)) return null
+  const diff = Date.now() - ts
+  if (diff < 0) return null
+  const min = 60 * 1000
+  const hour = 60 * min
+  const day = 24 * hour
+  if (diff < min) return 'just now'
+  if (diff < hour) return `${Math.floor(diff / min)}m ago`
+  if (diff < day) return `${Math.floor(diff / hour)}h ago`
+  if (diff < 30 * day) return `${Math.floor(diff / day)}d ago`
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
+export default function OrganizationsPage() {
+  // -- Stores --
+  const me = useAuthStore((s) => s.user)
+  const organizations = useOrganizationStore((s) => s.organizations)
+  const activeOrgId = useOrganizationStore((s) => s.activeOrgId)
+  const setActive = useOrganizationStore((s) => s.setActive)
+  const refresh = useOrganizationStore((s) => s.refresh)
+  const storeStatus = useOrganizationStore((s) => s.status)
+  const canManageOrg = useCan('organization.dashboard.manage')
+
+  // -- Toolbar state --
+  const [roleFilter, setRoleFilter] = useState('all')
+  const [sort, setSort] = useState('name')
+  const tb = useListToolbarState()
+
+  // -- UI state --
+  const [stats, setStats] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [renamingId, setRenamingId] = useState(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [renameBusy, setRenameBusy] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
+
+  // -- Recompute per-org counts whenever the org list changes --
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (organizations.length === 0) { setStats({}); setLoading(false); return }
+    const recompute = () => {
+      try {
+        const servers = JSON.parse(localStorage.getItem('cp_servers') || '[]')
+        const audit = JSON.parse(localStorage.getItem('cp_audit') || '[]')
+        const memberships = JSON.parse(localStorage.getItem('cp_memberships') || '[]')
+        const map = {}
+        for (const o of organizations) {
+          const orgAudit = audit.filter((a) => a.orgId === o.id)
+          let lastActivityAt = null
+          for (const a of orgAudit) {
+            const t = a.at || a.timestamp || a.createdAt || a.ts
+            const ms = t ? new Date(t).getTime() : NaN
+            if (Number.isFinite(ms) && (lastActivityAt === null || ms > lastActivityAt)) {
+              lastActivityAt = ms
+            }
+          }
+          map[o.id] = {
+            members: memberships.filter((m) => m.organizationId === o.id).length,
+            servers: servers.filter((s) => s.orgId === o.id).length,
+            audit: orgAudit.length,
+            lastActivityAt,
+          }
+        }
+        setStats(map)
+      } catch {
+        setStats({})
+      }
+    }
+    recompute()
+    setLoading(false)
+    const onChange = (e) => { if (e.key && e.key.startsWith('cp_')) recompute() }
+    window.addEventListener('storage', onChange)
+    return () => window.removeEventListener('storage', onChange)
+  }, [organizations])
+
+  // -- myRoles map (orgId -> 'owner'|'admin'|'member'|'viewer'|null) --
+  const myRoles = useMemo(() => {
+    if (typeof window === 'undefined') return {}
+    const auth = JSON.parse(localStorage.getItem('cp_auth') || 'null')
+    if (!auth) return {}
+    const ms = JSON.parse(localStorage.getItem('cp_memberships') || '[]')
+    const roles = JSON.parse(localStorage.getItem('cp_roles') || '[]')
+    const out = {}
+    for (const o of organizations) {
+      const row = ms.find((m) => m.organizationId === o.id && m.userId === auth.userId)
+      if (!row) { out[o.id] = null; continue }
+      if (row.roleId === null) { out[o.id] = 'owner'; continue }
+      const r = roles.find((r) => r.id === row.roleId)
+      out[o.id] = r?.name || 'member'
+    }
+    return out
+  }, [organizations])
+
+  // -- Top-level stats --
+  const counts = useMemo(() => {
+    const owned = Object.values(myRoles).filter((r) => r === 'owner').length
+    const member = Object.values(myRoles).filter((r) => r && r !== 'owner').length
+    const servers = Object.values(stats).reduce((sum, s) => sum + (Number(s?.servers) || 0), 0)
+    return {
+      total: organizations.length,
+      owned,
+      member,
+      servers,
+    }
+  }, [organizations, myRoles, stats])
+
+  // -- Per-role counts for filter dropdown --
+  const roleFilterCounts = useMemo(() => {
+    const out = { all: counts.total, owner: 0, admin: 0, member: 0, viewer: 0 }
+    for (const r of Object.values(myRoles)) {
+      if (r && out[r] !== undefined) out[r] += 1
+    }
+    return out
+  }, [myRoles, counts.total])
+
+  // -- Filtered + sorted org list --
+  const filtered = useMemo(() => {
+    const q = tb.search.trim().toLowerCase()
+    let list = organizations.filter((o) => {
+      if (roleFilter !== 'all' && myRoles[o.id] !== roleFilter) return false
+      if (q) {
+        const hay = ((o.name || '') + ' ' + (o.description || '')).toLowerCase()
+        if (!hay.includes(q)) return false
+      }
+      return true
+    })
+    // active org first within ties — stable, predictable.
+    list = [...list].sort((a, b) => {
+      const sa = (sortCompare(a, b, sort, myRoles))
+      if (sa !== 0) return sa
+      if (a.id === activeOrgId) return -1
+      if (b.id === activeOrgId) return 1
+      return a.name.localeCompare(b.name)
+    })
+    return list
+  }, [organizations, myRoles, tb.search, roleFilter, sort, activeOrgId])
+
+  // -- Toolbar filter-active detection --
+  const filtersActive = tb.search.trim().length > 0 || roleFilter !== 'all' || sort !== 'name'
+  const clearFilters = () => { tb.clear(); setRoleFilter('all'); setSort('name') }
+
+  // -- Mutations --
+  const onSwitch = async (orgId) => {
+    if (orgId === activeOrgId) return
+    try {
+      await setActive(orgId)
+      showToast.success(`Switched to ${organizations.find((o) => o.id === orgId)?.name || 'organization'}`)
+    } catch (err) {
+      showToast.error(err?.message || 'Failed to switch organization')
+    }
+  }
+
+  const beginRename = (org) => {
+    setRenamingId(org.id)
+    setRenameDraft(org.name)
+  }
+
+  const cancelRename = () => {
+    setRenamingId(null)
+    setRenameDraft('')
+    setRenameBusy(false)
+  }
+
+  const saveRename = async () => {
+    if (!renamingId) return
+    const next = renameDraft.trim()
+    if (!next) { showToast.error('Name is required'); return }
+    if (renameBusy) return
+    setRenameBusy(true)
+    try {
+      await api.renameOrganization(renamingId, next)
+      await refresh()
+      showToast.success('Organization renamed')
+      cancelRename()
+    } catch (err) {
+      showToast.error(err?.message || 'Failed to rename')
+      setRenameBusy(false)
+    }
+  }
+
+  const onDelete = async () => {
+    if (!deleteTarget || deleteBusy) return
+    setDeleteBusy(true)
+    try {
+      await api.deleteOrganization(deleteTarget.id)
+      showToast.success(`"${deleteTarget.name}" deleted`)
+      setDeleteTarget(null)
+      await refresh()
+    } catch (err) {
+      showToast.error(err?.message || 'Failed to delete')
+    } finally {
+      setDeleteBusy(false)
+    }
+  }
+
+  const onCreate = async ({ name, description }) => {
+    const created = await api.createOrganization({ name, description })
+    await refresh()
+    await setActive(created.id)
+    showToast.success('Organization created')
+  }
+
+  // -- Render --
+  const initialLoading = loading && storeStatus !== 'ready'
+
+  return (
+    <PageContainer size="md">
+      <PageHeader
+        title="Organizations"
+        description="Every organization you belong to. Each one has its own members, connected servers, and audit log."
+      >
+        <Button onClick={() => setCreateOpen(true)} disabled={!canManageOrg} className="gap-2">
+          <Plus className="h-4 w-4" />
+          Create organization
+        </Button>
+      </PageHeader>
+
+      {initialLoading ? (
+        <LoadingState label="Loading organizations…" />
+      ) : organizations.length === 0 ? (
+        <EmptyState
+          icon={Building2}
+          title="Welcome — let's set up your first organization"
+          description="Each organization groups its own members, servers, and audit log. You'll be its owner."
+          action={
+            canManageOrg ? (
+              <Button onClick={() => setCreateOpen(true)} className="gap-2">
+                <Plus className="h-4 w-4" />
+                Create your first organization
+              </Button>
+            ) : null
+          }
+        />
+      ) : (
+        <>
+          <StatRow tiles={[
+            { label: 'Organizations', value: counts.total,    icon: Building2, tone: 'indigo'  },
+            { label: 'You own',       value: counts.owned,    icon: ShieldCheck, tone: 'amber' },
+            { label: "You're in",     value: counts.member,   icon: UserPlus,  tone: 'slate'   },
+            { label: 'Servers',       value: counts.servers,  icon: ArrowUpDown, tone: 'emerald' },
+          ]} />
+
+          <ListToolbar
+            searchInput={tb.searchInput}
+            onSearchInputChange={tb.setSearchInput}
+            placeholder="Search organizations…"
+            searchAriaLabel="Search organizations"
+            filtersActive={filtersActive}
+            onClearFilters={clearFilters}
+            resultsCount={filtered.length}
+            totalCount={counts.total}
+            filterSlot={
+              <>
+                <div className="relative">
+                  <select
+                    value={roleFilter}
+                    onChange={(e) => setRoleFilter(e.target.value)}
+                    className="h-10 pl-3 pr-8 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm text-slate-700 dark:text-slate-200 appearance-none cursor-pointer hover:border-slate-300 dark:hover:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-colors"
+                    aria-label="Filter by role"
+                  >
+                    {(['all', 'owner', 'admin', 'member', 'viewer'].filter((v) => v === 'all' || (roleFilterCounts[v] || 0) > 0)).map((v) => (
+                      <option key={v} value={v}>
+                        {v === 'all' ? 'All roles' : ROLE_META[v].label} ({v === 'all' ? roleFilterCounts.all : (roleFilterCounts[v] || 0)})
+                      </option>
+                    ))}
+                  </select>
+                  <Filter className="absolute right-2 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 pointer-events-none" />
+                </div>
+
+                <div className="relative">
+                  <select
+                    value={sort}
+                    onChange={(e) => setSort(e.target.value)}
+                    className="h-10 pl-3 pr-8 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm text-slate-700 dark:text-slate-200 appearance-none cursor-pointer hover:border-slate-300 dark:hover:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-colors"
+                    aria-label="Sort"
+                  >
+                    {SORT_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                  <ArrowUpDown className="absolute right-2 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 pointer-events-none" />
+                </div>
+              </>
+            }
+          />
+
+          {filtered.length === 0 ? (
+            <NoMatchesState
+              className="mt-4"
+              title="No organizations match your filters"
+              description="Try a different search or role filter."
+              onClear={clearFilters}
+            />
+          ) : loading ? (
+            <OrgsSkeleton />
+          ) : (
+            <>
+              <div className="hidden md:block">
+                <OrgsTable
+                  orgs={filtered}
+                  stats={stats}
+                  myRoles={myRoles}
+                  activeOrgId={activeOrgId}
+                  renamingId={renamingId}
+                  renameDraft={renameDraft}
+                  setRenameDraft={setRenameDraft}
+                  onBeginRename={beginRename}
+                  onCancelRename={cancelRename}
+                  onSaveRename={saveRename}
+                  renameBusy={renameBusy}
+                  onSwitch={onSwitch}
+                  onAskDelete={setDeleteTarget}
+                  counts={counts}
+                  canManageOrg={canManageOrg}
+                />
+              </div>
+              <div className="md:hidden">
+                <OrgsCardList
+                  orgs={filtered}
+                  stats={stats}
+                  myRoles={myRoles}
+                  activeOrgId={activeOrgId}
+                  renamingId={renamingId}
+                  renameDraft={renameDraft}
+                  setRenameDraft={setRenameDraft}
+                  onBeginRename={beginRename}
+                  onCancelRename={cancelRename}
+                  onSaveRename={saveRename}
+                  renameBusy={renameBusy}
+                  onSwitch={onSwitch}
+                  onAskDelete={setDeleteTarget}
+                  counts={counts}
+                  canManageOrg={canManageOrg}
+                />
+              </div>
+            </>
+          )}
+        </>
+      )}
+
+      <CreateOrgDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onSubmit={onCreate}
+      />
+
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(o) => !o && !deleteBusy && setDeleteTarget(null)}
+        title="Delete this organization?"
+        description={
+          deleteTarget
+            ? `"${deleteTarget.name}" and every member, server, and audit entry under it will be permanently removed. This cannot be undone.`
+            : ''
+        }
+        confirmText="Delete organization"
+        variant="destructive"
+        icon={<Trash2 className="h-5 w-5" />}
+        loading={deleteBusy}
+        onConfirm={onDelete}
+      />
+    </PageContainer>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Table (desktop) + Card list (mobile)
+// ---------------------------------------------------------------------------
+
+function OrgsTable(props) {
+  return (
+    <Card className="mt-4 p-0 overflow-hidden border-slate-200 dark:border-slate-700">
+      <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/30">
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+          Your organizations
+        </p>
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow className="bg-slate-50/30 dark:bg-slate-800/20">
+            <TableHead className="font-medium">Organization</TableHead>
+            <TableHead className="font-medium">Your role</TableHead>
+            <TableHead className="font-medium text-right hidden sm:table-cell">Members</TableHead>
+            <TableHead className="font-medium text-right hidden md:table-cell">Servers</TableHead>
+            <TableHead className="font-medium text-right hidden lg:table-cell">Audit</TableHead>
+            <TableHead className="w-44 text-right">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {props.orgs.map((o) => (
+            <OrgsTableRow key={o.id} org={o} {...props} />
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
+  )
+}
+
+function OrgsTableRow({ org, stats, myRoles, activeOrgId, renamingId, renameDraft, setRenameDraft, onBeginRename, onCancelRename, onSaveRename, renameBusy, onSwitch, onAskDelete, counts, canManageOrg }) {
+  const role = myRoles[org.id]
+  const meta = ROLE_META[role] || ROLE_META.member
+  const isActive = org.id === activeOrgId
+  const isRenaming = renamingId === org.id
+  const isOwner = role === 'owner'
+  const ownedCount = counts.owned
+  const canDelete = isOwner && ownedCount > 1
+  const canManageThisOrg = canManageOrg && isOwner
+  const s = stats[org.id] || { members: 0, servers: 0, audit: 0 }
+
+  // Inline rename handlers
+  const onRenameKeyDown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); onSaveRename() }
+    else if (e.key === 'Escape') { e.preventDefault(); onCancelRename() }
+  }
+
+  const trClasses = cn(
+    'group transition-colors',
+    isActive && 'bg-indigo-50/40 dark:bg-indigo-500/[0.06]',
+    isRenaming && 'bg-amber-50/40 dark:bg-amber-500/[0.05]'
+  )
+
+  return (
+    <TableRow className={trClasses} data-org-id={org.id}>
+      <TableCell className="align-middle">
+        <div className="flex items-center gap-3 min-w-0 py-1">
+          <OrgAvatar org={org} active={isActive} />
+          <div className="min-w-0 flex-1">
+            {isRenaming ? (
+              <div className="flex items-center gap-1.5">
+                <Input
+                  autoFocus
+                  value={renameDraft}
+                  onChange={(e) => setRenameDraft(e.target.value)}
+                  onKeyDown={onRenameKeyDown}
+                  disabled={renameBusy}
+                  className="h-8 max-w-[260px] text-sm bg-white dark:bg-slate-900 border-amber-300 dark:border-amber-500/60 focus-visible:ring-amber-500/40"
+                  aria-label={`Rename ${org.name}`}
+                />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={onSaveRename}
+                  disabled={renameBusy || !renameDraft.trim()}
+                  className="h-8 w-8 text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-500/10"
+                  aria-label="Save name"
+                >
+                  {renameBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={onCancelRename}
+                  disabled={renameBusy}
+                  className="h-8 w-8 text-slate-500 hover:text-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  aria-label="Cancel rename"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            ) : (
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <p className="font-semibold text-slate-900 dark:text-white truncate">{org.name}</p>
+                  {isActive && <ActiveChip />}
+                  {org.description && (
+                    <p className="text-xs text-slate-500 dark:text-slate-400 truncate hidden xl:block max-w-[280px]">
+                      {org.description}
+                    </p>
+                  )}
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                  Created {new Date(org.createdAt).toLocaleDateString()}{s.lastActivityAt ? ` · Last active ${formatRelative(s.lastActivityAt)}` : ''}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      </TableCell>
+
+      <TableCell>
+        {role ? <Badge variant={meta.variant} size="sm">{meta.label}</Badge> : (
+          <span className="text-xs text-slate-400 dark:text-slate-500">—</span>
+        )}
+      </TableCell>
+
+      <TableCell className="text-right text-sm tabular-nums text-slate-700 dark:text-slate-200 hidden sm:table-cell">{s.members}</TableCell>
+      <TableCell className="text-right text-sm tabular-nums text-slate-700 dark:text-slate-200 hidden md:table-cell">{s.servers}</TableCell>
+      <TableCell className="text-right text-sm tabular-nums text-slate-700 dark:text-slate-200 hidden lg:table-cell">{s.audit}</TableCell>
+
+      <TableCell>
+        <OrgsRowActions
+          org={org}
+          isActive={isActive}
+          isRenaming={isRenaming}
+          canManageThisOrg={canManageThisOrg}
+          canDelete={canDelete}
+          onSwitch={onSwitch}
+          onBeginRename={onBeginRename}
+          onAskDelete={onAskDelete}
+        />
+      </TableCell>
+    </TableRow>
+  )
+}
+
+function OrgsRowActions({ org, isActive, isRenaming, canManageThisOrg, canDelete, onSwitch, onBeginRename, onAskDelete }) {
+  if (isRenaming) {
+    return <div className="text-right text-xs text-slate-400 dark:text-slate-500">Renaming…</div>
+  }
+  return (
+    <div className="flex items-center justify-end gap-1.5">
+      {canManageThisOrg && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => onBeginRename(org)}
+          className="h-8 w-8 text-slate-500 hover:text-indigo-600 dark:hover:text-indigo-300"
+          aria-label={`Rename ${org.name}`}
+          title="Rename"
+        >
+          <Pencil className="h-4 w-4" />
+        </Button>
+      )}
+      {canManageThisOrg && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => onAskDelete(org)}
+          disabled={!canDelete}
+          className={cn(
+            'h-8 w-8',
+            canDelete
+              ? 'text-slate-500 hover:text-red-600 dark:hover:text-red-400'
+              : 'text-slate-300 dark:text-slate-600 cursor-not-allowed'
+          )}
+          aria-label={`Delete ${org.name}`}
+          title={canDelete ? 'Delete organization' : 'Create or own another organization first'}
+        >
+          <Trash2 className="h-4 w-4" />
+        </Button>
+      )}
+      {!isActive ? (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => onSwitch(org.id)}
+          className="h-8 gap-1.5"
+        >
+          Switch
+        </Button>
+      ) : (
+        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300 px-2 h-8 whitespace-nowrap">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden />
+          Active
+        </span>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Mobile card list
+// ---------------------------------------------------------------------------
+
+function OrgsCardList(props) {
+  return (
+    <div className="mt-4 space-y-3">
+      {props.orgs.map((o) => (
+        <OrgsCard key={o.id} org={o} {...props} />
+      ))}
+    </div>
+  )
+}
+
+function OrgsCard({ org, stats, myRoles, activeOrgId, renamingId, renameDraft, setRenameDraft, onBeginRename, onCancelRename, onSaveRename, renameBusy, onSwitch, onAskDelete, counts, canManageOrg }) {
+  const role = myRoles[org.id]
+  const meta = ROLE_META[role] || ROLE_META.member
+  const isActive = org.id === activeOrgId
+  const isRenaming = renamingId === org.id
+  const isOwner = role === 'owner'
+  const ownedCount = counts.owned
+  const canDelete = isOwner && ownedCount > 1
+  const canManageThisOrg = canManageOrg && isOwner
+  const s = stats[org.id] || { members: 0, servers: 0, audit: 0 }
+
+  const onRenameKeyDown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); onSaveRename() }
+    else if (e.key === 'Escape') { e.preventDefault(); onCancelRename() }
+  }
+
+  const cardClasses = cn(
+    'p-0 overflow-hidden transition-shadow',
+    isActive
+      ? 'border-indigo-300 dark:border-indigo-500/50 ring-2 ring-indigo-500/20 dark:ring-indigo-500/30 shadow-sm'
+      : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600'
+  )
+
+  const headerBg = isActive
+    ? 'bg-indigo-50/60 dark:bg-indigo-500/10 border-indigo-200/60 dark:border-indigo-500/30'
+    : 'bg-slate-50/40 dark:bg-slate-800/40 border-slate-200 dark:border-slate-700'
+
+  return (
+    <Card className={cardClasses}>
+      <div className={cn('flex items-start justify-between gap-3 px-4 py-4 border-b', headerBg)}>
+        <div className="flex items-start gap-3 min-w-0 flex-1">
+          <OrgAvatar org={org} active={isActive} />
+          <div className="min-w-0 flex-1">
+            {isRenaming ? (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <Input
+                  autoFocus
+                  value={renameDraft}
+                  onChange={(e) => setRenameDraft(e.target.value)}
+                  onKeyDown={onRenameKeyDown}
+                  disabled={renameBusy}
+                  className="h-9 flex-1 min-w-[160px] text-sm bg-white dark:bg-slate-900 border-amber-300 dark:border-amber-500/60 focus-visible:ring-amber-500/40"
+                  aria-label={`Rename ${org.name}`}
+                />
+                <Button size="icon" variant="ghost" onClick={onSaveRename} disabled={renameBusy || !renameDraft.trim()} className="h-9 w-9 text-emerald-600" aria-label="Save name">
+                  {renameBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                </Button>
+                <Button size="icon" variant="ghost" onClick={onCancelRename} disabled={renameBusy} className="h-9 w-9 text-slate-500" aria-label="Cancel rename">
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="font-semibold text-slate-900 dark:text-white truncate">{org.name}</p>
+                  {isActive && <ActiveChip />}
+                  {role && <Badge variant={meta.variant} size="sm">{meta.label}</Badge>}
+                </div>
+                {org.description && (
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 line-clamp-2">{org.description}</p>
+                )}
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                  Created {new Date(org.createdAt).toLocaleDateString()}{s.lastActivityAt ? ` · Last active ${formatRelative(s.lastActivityAt)}` : ''}
+                </p>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 py-3 grid grid-cols-3 gap-3 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+        <Stat label="Members" value={s.members} />
+        <Stat label="Servers" value={s.servers} />
+        <Stat label="Audit" value={s.audit} />
+      </div>
+
+      <div className="px-4 py-3 flex items-center gap-1.5 flex-wrap">
+        {canManageThisOrg && !isRenaming && (
+          <Button variant="ghost" size="sm" onClick={() => onBeginRename(org)} className="h-9 px-3 text-slate-600 dark:text-slate-300 hover:text-indigo-600">
+            <Pencil className="h-4 w-4 mr-1" />
+            Rename
+          </Button>
+        )}
+        {canManageThisOrg && !isRenaming && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => onAskDelete(org)}
+            disabled={!canDelete}
+            className={cn(
+              'h-9 px-3',
+              canDelete
+                ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10'
+                : 'text-slate-300 dark:text-slate-600 cursor-not-allowed'
+            )}
+            title={canDelete ? undefined : 'Create or own another organization first'}
+          >
+            <Trash2 className="h-4 w-4 mr-1" />
+            Delete
+          </Button>
+        )}
+        {!isActive ? (
+          <Button size="sm" variant="outline" onClick={() => onSwitch(org.id)} className="h-9 px-3 ml-auto">
+            Switch
+          </Button>
+        ) : (
+          <span className="ml-auto inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-300 px-2">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden />
+            Active
+          </span>
+        )}
+      </div>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton
+// ---------------------------------------------------------------------------
+
+function OrgsSkeleton() {
+  return (
+    <Card className="mt-4 p-0 overflow-hidden border-slate-200 dark:border-slate-700">
+      <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/30">
+        <Skeleton className="h-3 w-32" />
+      </div>
+      <div className="hidden md:block">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead><Skeleton className="h-3 w-24" /></TableHead>
+              <TableHead><Skeleton className="h-3 w-16" /></TableHead>
+              <TableHead className="text-right"><Skeleton className="h-3 w-14 ml-auto" /></TableHead>
+              <TableHead className="text-right"><Skeleton className="h-3 w-14 ml-auto" /></TableHead>
+              <TableHead className="text-right"><Skeleton className="h-3 w-14 ml-auto" /></TableHead>
+              <TableHead><Skeleton className="h-3 w-16 ml-auto" /></TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {Array.from({ length: 5 }).map((_, i) => (
+              <TableRow key={i}>
+                <TableCell><div className="flex items-center gap-3 py-1"><Skeleton className="h-9 w-9 rounded-lg" /><div className="space-y-1.5"><Skeleton className="h-4 w-40" /><Skeleton className="h-3 w-24" /></div></div></TableCell>
+                <TableCell><Skeleton className="h-5 w-16" /></TableCell>
+                <TableCell className="text-right"><Skeleton className="h-4 w-8 ml-auto" /></TableCell>
+                <TableCell className="text-right"><Skeleton className="h-4 w-8 ml-auto" /></TableCell>
+                <TableCell className="text-right"><Skeleton className="h-4 w-8 ml-auto" /></TableCell>
+                <TableCell><div className="flex justify-end gap-1"><Skeleton className="h-8 w-8" /><Skeleton className="h-8 w-8" /><Skeleton className="h-8 w-16" /></div></TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="md:hidden space-y-3 p-3">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <Card key={i} className="p-4 space-y-2 border-slate-200 dark:border-slate-700">
+            <div className="flex items-center gap-3"><Skeleton className="h-9 w-9 rounded-lg" /><div className="space-y-1.5"><Skeleton className="h-4 w-32" /><Skeleton className="h-3 w-20" /></div></div>
+            <div className="flex gap-3 mt-2">
+              <Skeleton className="h-8 flex-1" />
+              <Skeleton className="h-8 flex-1" />
+              <Skeleton className="h-8 flex-1" />
+            </div>
+            <div className="flex justify-end gap-2 mt-2">
+              <Skeleton className="h-9 w-20" />
+              <Skeleton className="h-9 w-24" />
+            </div>
+          </Card>
+        ))}
+      </div>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Atoms
+// ---------------------------------------------------------------------------
+
+function OrgAvatar({ org, active }) {
+  return (
+    <div className={cn(
+      'h-10 w-10 rounded-xl flex items-center justify-center shrink-0',
+      active
+        ? 'bg-indigo-600 text-white'
+        : 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400'
+    )}>
+      <Building2 className="h-5 w-5" />
+    </div>
+  )
+}
+
+function ActiveChip() {
+  return (
+    <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-white bg-indigo-600 dark:bg-indigo-500 rounded-full px-2 py-0.5 shrink-0">
+      <Check className="h-3 w-3" />
+      Active
+    </span>
+  )
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500">{label}</p>
+      <p className="text-base font-semibold text-slate-900 dark:text-white tabular-nums mt-0.5">
+        {Number.isFinite(value) ? value.toLocaleString() : 0}
+      </p>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Create dialog (kept identical to previous version, light validation added)
+// ---------------------------------------------------------------------------
+
+function CreateOrgDialog({ open, onOpenChange, onSubmit }) {
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [nameTouched, setNameTouched] = useState(false)
+  useEffect(() => {
+    if (open) { setName(''); setDescription(''); setBusy(false); setNameTouched(false) }
+  }, [open])
+
+  const trimmedName = name.trim()
+  const nameError = nameTouched && trimmedName.length === 0
+    ? 'Name is required'
+    : trimmedName.length > 60
+    ? 'Max 60 characters'
+    : null
+  const canSubmit = trimmedName.length > 0 && trimmedName.length <= 60 && !busy
+
+  const submit = async (e) => {
+    e?.preventDefault?.()
+    if (!canSubmit) return
+    setBusy(true)
+    try {
+      await onSubmit({ name: trimmedName, description: description.trim() })
+      onOpenChange(false)
+    } catch (err) {
+      showToast.error(err?.message || 'Failed to create organization')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        size="default"
+        header={
+          <DialogHeader className="px-6 pt-5">
+            <div className="flex items-start gap-4 pr-8">
+              <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 shrink-0">
+                <Building2 className="h-5 w-5" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <DialogTitle className="text-slate-900 dark:text-white text-xl">
+                  Create organization
+                </DialogTitle>
+                <DialogDescription className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+                  An organization groups its own members, connected servers,
+                  and audit log. You become its owner.
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+        }
+        footer={
+          <div className="px-6 py-4 flex justify-end items-center gap-3 bg-white dark:bg-slate-900">
+            <button
+              type="button"
+              onClick={() => onOpenChange(false)}
+              disabled={busy}
+              className="h-11 px-4 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <Button onClick={submit} loading={busy} disabled={!canSubmit} className="h-11 px-5 rounded-xl bg-gradient-to-b from-indigo-500 to-indigo-600 hover:from-indigo-400 hover:to-indigo-500 shadow-sm hover:shadow-md transition-all gap-2">
+              <Plus className="h-4 w-4" />
+              Create organization
+            </Button>
+          </div>
+        }
+      >
+        <form onSubmit={submit} className="px-6 py-5 space-y-5">
+          <FieldRow
+            label="Name"
+            htmlFor="manage-org-name"
+            error={nameError}
+          >
+            <Input
+              id="manage-org-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={() => setNameTouched(true)}
+              placeholder="ServerAvatar, Client A, Personal Servers, ..."
+              autoFocus
+              maxLength={60}
+              required
+              aria-invalid={!!nameError}
+            />
+          </FieldRow>
+          <FieldRow
+            label="Description"
+            htmlFor="manage-org-description"
+            optional
+            helper="Shown in the organization card subtitle."
+          >
+            <Input id="manage-org-description" value={description} onChange={(e) => setDescription(e.target.value)} maxLength={140} />
+          </FieldRow>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function sortCompare(a, b, sort, myRoles) {
+  if (sort === 'name') return a.name.localeCompare(b.name)
+  if (sort === 'name-desc') return b.name.localeCompare(a.name)
+  if (sort === 'created') return new Date(b.createdAt) - new Date(a.createdAt)
+  if (sort === 'created-asc') return new Date(a.createdAt) - new Date(b.createdAt)
+  if (sort === 'role') {
+    const ra = ROLE_SORT_ORDER[myRoles[a.id]] ?? ROLE_SORT_FALLBACK
+    const rb = ROLE_SORT_ORDER[myRoles[b.id]] ?? ROLE_SORT_FALLBACK
+    return ra - rb || a.name.localeCompare(b.name)
+  }
+  return 0
+}
